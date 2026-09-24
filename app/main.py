@@ -11,12 +11,13 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import consensus, db, ingest, review_groups
+from . import consensus, db, experiments, ingest, review_groups
 from .config import Settings, get_settings
 from .matcher import candidate_to_dict, match_address, result_to_dict
 from .schemas import (
     AddressBatchIn,
     BatchMatchRequest,
+    ExperimentRequest,
     GroupReviewAction,
     MatchRequest,
     ReviewAction,
@@ -45,6 +46,7 @@ def settings_dep() -> Settings:
 async def lifespan(_app: FastAPI):
     # Auto-load the bundled sample data on first run so the UI works
     # immediately with the documented one-line Docker command.
+    global _conn
     conn = get_conn()
     if db.count_addresses(conn) == 0:
         sample = Path(get_settings().sample_csv)
@@ -53,6 +55,9 @@ async def lifespan(_app: FastAPI):
     yield
     if _conn is not None:
         _conn.close()
+        # Reset so a later lifespan (e.g. repeated TestClient runs in tests)
+        # opens a fresh connection instead of reusing the closed one.
+        _conn = None
 
 
 app = FastAPI(
@@ -77,11 +82,18 @@ def index(request: Request) -> HTMLResponse:
 
 
 @app.get("/api/health")
-def health(conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+def health(conn: db.sqlite3.Connection = Depends(get_conn),
+           settings: Settings = Depends(settings_dep)) -> dict[str, Any]:
     return {
         "status": "ok",
         "address_count": db.count_addresses(conn),
         "needs_review": db.count_match_logs(conn, "needs_review"),
+        "thresholds": {
+            "auto_threshold": settings.auto_threshold,
+            "margin_threshold": settings.margin_threshold,
+            "reject_threshold": settings.reject_threshold,
+            "token_weight": settings.token_weight,
+        },
     }
 
 
@@ -375,3 +387,49 @@ def review_group(payload: GroupReviewAction,
     except review_groups.GroupReviewError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **result}
+
+
+# --- A/B rule experiments ---------------------------------------------------
+
+
+@app.post("/api/experiments")
+def create_experiment(payload: ExperimentRequest,
+                      conn: db.sqlite3.Connection = Depends(get_conn),
+                      settings: Settings = Depends(settings_dep)) -> dict[str, Any]:
+    """提交规则 A/B 对照实验。
+
+    2～4 个命名规则档案（自动命中/拒绝/分差阈值、词元权重）在 **同一地址表
+    快照** 下逐档运行现有匹配器（纯评分，不写匹配日志、不应用复核共识）。
+    档案参数非法或查询重复时逐项报错（400）且不执行；结果持久化后返回。
+    """
+    if db.count_addresses(conn) == 0:
+        raise HTTPException(status_code=400, detail="标准地址表为空，请先上传或加载示例数据")
+    try:
+        return experiments.run_experiment(conn, payload.model_dump(), settings)
+    except experiments.ExperimentValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "errors": exc.errors},
+        ) from exc
+
+
+@app.get("/api/experiments")
+def list_experiments(limit: int = 50, offset: int = 0,
+                     conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """列出历史 A/B 实验（不含逐条结果，按实验编号回看请用详情接口）。"""
+    limit = max(1, min(limit, 200))
+    rows = db.list_rule_experiments(conn, limit=limit, offset=offset)
+    return {
+        "total": db.count_rule_experiments(conn),
+        "items": [experiments.serialize_experiment_summary(r, conn) for r in rows],
+    }
+
+
+@app.get("/api/experiments/{experiment_id}")
+def get_experiment(experiment_id: int,
+                   conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    """按实验编号回看完整结果；``snapshot_current`` 标示地址表是否已变化。"""
+    row = db.get_rule_experiment(conn, experiment_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    return experiments.serialize_experiment(row, conn)

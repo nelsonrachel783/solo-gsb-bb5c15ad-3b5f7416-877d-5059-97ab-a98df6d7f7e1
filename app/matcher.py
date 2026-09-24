@@ -245,6 +245,9 @@ class MatchResult:
     runner_up: CandidateResult | None
     candidates: list[CandidateResult]
     thresholds: dict[str, float]
+    # Which decision rule fired: reject_threshold | margin_threshold |
+    # auto_threshold | None (no candidates at all).
+    triggered: str | None = None
     # Populated by app/consensus.py from the reviewed-record memory; scoring
     # itself never touches this.
     consensus: dict[str, Any] | None = None
@@ -341,13 +344,26 @@ def match_address(query_text: str, rows: list[Any], settings: Settings) -> Match
     runner_up = top[1] if len(top) > 1 else None
 
     if best is None or best.score < settings.reject_threshold:
-        status, reason = "no_match", "所有候选得分均低于拒绝阈值"
-    elif runner_up is not None and (best.score - runner_up.score) < settings.margin_threshold:
-        status, reason = "needs_review", "最高分与次高分差距过小，结果存在歧义"
+        status, reason, triggered = (
+            "no_match", "所有候选得分均低于拒绝阈值", "reject_threshold",
+        )
     elif best.score < settings.auto_threshold:
-        status, reason = "needs_review", "最高得分低于自动确认阈值（可能门牌号或地区字段冲突）"
+        # The auto threshold itself is what blocks automatic acceptance, even
+        # when the margin is also small -- the score could never auto-match.
+        status, reason, triggered = (
+            "needs_review",
+            "最高得分低于自动确认阈值（可能门牌号或地区字段冲突）",
+            "auto_threshold",
+        )
+    elif runner_up is not None and (best.score - runner_up.score) < settings.margin_threshold:
+        # Score cleared the auto threshold, but the lead is too small.
+        status, reason, triggered = (
+            "needs_review", "最高分与次高分差距过小，结果存在歧义", "margin_threshold",
+        )
     else:
-        status, reason = "auto_matched", "得分达到自动确认阈值且领先优势明显"
+        status, reason, triggered = (
+            "auto_matched", "得分达到自动确认阈值且领先优势明显", "auto_threshold",
+        )
 
     return MatchResult(
         query=query_text,
@@ -363,6 +379,7 @@ def match_address(query_text: str, rows: list[Any], settings: Settings) -> Match
             "reject_threshold": settings.reject_threshold,
             "token_weight": settings.token_weight,
         },
+        triggered=triggered,
     )
 
 
@@ -423,6 +440,12 @@ def result_to_dict(result: MatchResult) -> dict[str, Any]:
         "runner_up_id": result.runner_up.address["id"] if result.runner_up else None,
         "runner_up_score": result.runner_up.score if result.runner_up else None,
         "thresholds": result.thresholds,
+        "triggered": result.triggered,
+        "margin": (
+            round(result.best.score - result.runner_up.score, 4)
+            if result.best is not None and result.runner_up is not None
+            else None
+        ),
         "candidates": [candidate_to_dict(c) for c in result.candidates],
         "consensus": result.consensus,
     }

@@ -56,3 +56,32 @@ class GroupReviewAction(BaseModel):
     match_ids: list[int] = Field(..., min_length=1)
     action: str = Field(..., pattern="^(confirmed|overridden|rejected)$")
     selected_id: int | None = None
+
+
+# --------------------------------------------------------- A/B rule experiments
+
+
+class RuleProfileIn(BaseModel):
+    """命名规则档案：自动命中/拒绝/分差阈值与词元权重。
+
+    字段全部可选（缺省回退到服务端当前阈值）；取值范围与档案间一致性由
+    ``app.experiments.validate_request`` 逐项校验并集中报错。
+    """
+
+    model_config = {"extra": "ignore"}
+
+    name: str | None = None
+    auto_threshold: float | None = None
+    reject_threshold: float | None = None
+    margin_threshold: float | None = None
+    token_weight: float | None = None
+
+
+class ExperimentRequest(BaseModel):
+    """规则 A/B 对照实验请求：2～4 个档案，1～100 条查询。"""
+
+    model_config = {"extra": "ignore"}
+
+    name: str | None = Field(default=None, max_length=80)
+    profiles: list[RuleProfileIn] = Field(..., min_length=2, max_length=4)
+    queries: list[str] = Field(..., min_length=1, max_length=100)

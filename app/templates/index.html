@@ -19,6 +19,7 @@
     <button class="tab active" data-tab="match">单条 / 批量匹配</button>
     <button class="tab" data-tab="table">标准地址表 <span id="addr-count" class="count"></span></button>
     <button class="tab" data-tab="review">待确认队列 <span id="review-count" class="count"></span></button>
+    <button class="tab" data-tab="ab">规则 A/B 实验</button>
 </nav>
 
 <main>
@@ -83,6 +84,33 @@
             <div id="review-groups"></div>
             <div id="review-list"></div>
         </div>
+    </section>
+
+    <!-- ====================== A/B rule experiment ====================== -->
+    <section id="tab-ab" class="panel">
+        <div class="card">
+            <h2>规则 A/B 对照实验</h2>
+            <p class="hint">
+                提交 2～4 个命名规则档案（自动命中阈值、拒绝阈值、前两名分差阈值、词元权重），
+                服务端在<b>同一地址表快照</b>下逐档运行现有匹配器；留空的参数使用服务端当前默认值。
+                每条查询返回各档状态、首选地址、得分、触发的阈值与候选差异，
+                并标出结论不一致的查询。参数非法或查询重复时逐项报错且不执行。
+            </p>
+            <div class="row wrap">
+                <input type="text" id="ab-name" placeholder="实验名称（可选）" style="max-width:320px">
+                <button id="btn-ab-run" class="primary">运行实验</button>
+                <button id="btn-ab-demo" class="ghost">填充示例</button>
+                <button id="btn-ab-add" class="ghost">＋ 增加档案</button>
+                <button id="btn-ab-history" class="ghost">历史实验</button>
+            </div>
+            <div id="ab-profiles" class="ab-profiles"></div>
+            <h3 class="ab-sub">查询（每行一条，1～100 条，不可重复）</h3>
+            <textarea id="ab-queries" rows="5"
+                placeholder="例如：1010 Lake Dr, Austin TX"></textarea>
+            <div id="ab-errors"></div>
+        </div>
+        <div id="ab-result"></div>
+        <div id="ab-history-box"></div>
     </section>
 </main>
 

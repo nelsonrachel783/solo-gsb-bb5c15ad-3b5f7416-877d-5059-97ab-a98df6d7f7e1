@@ -619,10 +619,325 @@ async function refreshHealth() {
         $("#health").className = "badge ok";
         $("#addr-count").textContent = h.address_count;
         $("#review-count").textContent = h.needs_review;
+        abDefaults = h.thresholds || abDefaults;
     } catch (err) {
         $("#health").textContent = "服务不可用";
         $("#health").className = "badge bad";
     }
 }
+
+// ------------------------------------------------------------- A/B experiment
+
+let abDefaults = { auto_threshold: 0.8, reject_threshold: 0.35,
+                   margin_threshold: 0.06, token_weight: 0.7 };
+// Each entry: { name, auto_threshold, reject_threshold, margin_threshold,
+//               token_weight } with "" meaning "use server default".
+let abProfiles = [];
+
+const AB_FIELDS = [
+    { key: "auto_threshold", label: "自动命中阈值", step: "0.01", min: "0", max: "1" },
+    { key: "reject_threshold", label: "拒绝阈值", step: "0.01", min: "0", max: "1" },
+    { key: "margin_threshold", label: "前两名分差", step: "0.01", min: "0", max: "1" },
+    { key: "token_weight", label: "词元权重", step: "0.01", min: "0", max: "1" },
+];
+
+const TRIGGER_LABEL = {
+    auto_threshold: "自动命中阈值",
+    reject_threshold: "拒绝阈值",
+    margin_threshold: "前两名分差",
+};
+
+const AB_DEMO_QUERIES = [
+    "1010 Lake Dr, Austin TX",
+    "Hillcrest Road, Dallas",
+    "123 main st ny",
+    "742 Evergreen Tce",
+].join("\n");
+
+function abLetter(i) { return String.fromCharCode(65 + i); }
+
+function abDefaultProfiles() {
+    // A = current server settings; B = a looser auto threshold so verdicts
+    // actually diverge on the demo queries.
+    return [
+        { name: "现行规则 A", auto_threshold: "", reject_threshold: "",
+          margin_threshold: "", token_weight: "" },
+        { name: "宽松规则 B", auto_threshold: "0.7", reject_threshold: "",
+          margin_threshold: "", token_weight: "" },
+    ];
+}
+
+function renderAbProfiles() {
+    const box = $("#ab-profiles");
+    box.innerHTML = abProfiles.map((p, i) => {
+        const fields = AB_FIELDS.map((f) => `
+            <label class="ab-field">${f.label}
+                <input type="number" step="${f.step}" min="${f.min}" max="${f.max}"
+                    data-ab-field="${f.key}" data-ab-profile="${i}"
+                    value="${p[f.key]}" placeholder="${abDefaults[f.key]}">
+            </label>`).join("");
+        return `
+        <div class="ab-profile" data-ab-index="${i}">
+            <div class="ab-profile-head">
+                <span class="ab-letter">${abLetter(i)}</span>
+                <input type="text" class="ab-profile-name" data-ab-profile-name="${i}"
+                    value="${escapeHtml(p.name)}" placeholder="档案 ${abLetter(i)} 名称">
+                ${i >= 2 ? `<button class="tiny reject ab-remove" data-ab-remove="${i}">移除</button>` : ""}
+            </div>
+            <div class="ab-fields">${fields}</div>
+            <div class="ab-effective muted">
+                生效参数：自动命中 ${Number(p.auto_threshold || abDefaults.auto_threshold)}，
+                拒绝 ${Number(p.reject_threshold || abDefaults.reject_threshold)}，
+                分差 ${Number(p.margin_threshold || abDefaults.margin_threshold)}，
+                词元权重 ${Number(p.token_weight || abDefaults.token_weight)}
+            </div>
+        </div>`;
+    }).join("");
+}
+
+function collectAbProfiles() {
+    abProfiles.forEach((p, i) => {
+        p.name = $(`[data-ab-profile-name="${i}"]`).value;
+        AB_FIELDS.forEach((f) => {
+            p[f.key] = $(`[data-ab-field="${f.key}"][data-ab-profile="${i}"]`).value.trim();
+        });
+    });
+    return abProfiles.map((p) => {
+        const out = { name: p.name.trim() };
+        AB_FIELDS.forEach((f) => {
+            if (p[f.key] !== "") out[f.key] = Number(p[f.key]);
+        });
+        return out;
+    });
+}
+
+function renderAbErrors(errors) {
+    const box = $("#ab-errors");
+    if (!errors || errors.length === 0) { box.innerHTML = ""; return; }
+    box.innerHTML = `<div class="ab-error-box">
+        <b>以下 ${errors.length} 项有问题，实验未执行：</b>
+        <ul>${errors.map((e) => `<li><code>${escapeHtml(e.location)}</code>：${escapeHtml(e.message)}</li>`).join("")}</ul>
+    </div>`;
+}
+
+function renderAbDiff(diff) {
+    if (!diff) return '<span class="muted">（基准档案 A）</span>';
+    const parts = [];
+    (diff.added || []).forEach((c) =>
+        parts.push(`<span class="ab-diff add">新增候选 #${c.address_id}（第 ${c.rank + 1} 名，${pct(c.score)}）</span>`));
+    (diff.removed || []).forEach((c) =>
+        parts.push(`<span class="ab-diff remove">跌出候选 #${c.address_id}（原第 ${c.rank + 1} 名，${pct(c.score)}）</span>`));
+    (diff.score_changed || []).forEach((c) =>
+        parts.push(`<span class="ab-diff score">#${c.address_id} 得分 ${pct(c.baseline_score)} → ${pct(c.score)}（${c.score_delta > 0 ? "+" : ""}${(c.score_delta * 100).toFixed(1)}pt）</span>`));
+    (diff.rank_changed || []).forEach((c) =>
+        parts.push(`<span class="ab-diff rank">#${c.address_id} 名次 第${c.baseline_rank + 1} → 第${c.rank + 1}</span>`));
+    return parts.length
+        ? `<div class="ab-diffs">${parts.join("")}</div>`
+        : '<span class="muted">候选集与得分与档案 A 相同</span>';
+}
+
+function renderAbQueryResult(row) {
+    const banner = row.conclusions_consistent
+        ? '<span class="ab-conclusion same">各档结论一致</span>'
+        : `<span class="ab-conclusion diff">⚠ 结论不一致：${escapeHtml(row.inconsistent_profiles.join("、"))} 与档案 A 不同</span>`;
+    const outcomes = row.outcomes.map((o) => {
+        const best = o.candidates[0];
+        const bestText = best
+            ? `#${best.address_id} ${escapeHtml(best.full_text)}`
+            : '<span class="muted">无候选</span>';
+        const trig = o.triggered
+            ? `触发 <b>${TRIGGER_LABEL[o.triggered] || o.triggered}</b>`
+            : '<span class="muted">无候选</span>';
+        const margin = o.margin === null || o.margin === undefined
+            ? "—"
+            : `${(o.margin * 100).toFixed(1)}pt`;
+        return `
+        <div class="ab-outcome${o.conclusion_differs ? " differs" : ""}">
+            <div class="ab-outcome-head">
+                <span class="ab-outcome-name">${escapeHtml(o.profile)}</span>
+                <span class="status ${o.status}">${STATUS_LABEL[o.status] || o.status}</span>
+            </div>
+            <div class="ab-outcome-best">首选：${bestText}</div>
+            <div class="scores">
+                <span class="score-chip">综合 <b>${pct(o.best_score)}</b></span>
+                <span class="score-chip">领先次名 ${margin}</span>
+                <span class="score-chip">${trig}</span>
+            </div>
+            <div class="ab-outcome-reason muted">${escapeHtml(o.reason)}</div>
+            ${renderAbDiff(o.candidate_diff)}
+        </div>`;
+    }).join("");
+    return `
+    <div class="ab-query${row.conclusions_consistent ? "" : " disagree"}">
+        <div class="query-line">🔍 #${row.query_index + 1} ${escapeHtml(row.query)}</div>
+        <div class="norm">归一化：${escapeHtml((row.normalized && row.normalized.text) || "（空）")}
+            · 门牌号 <b>${escapeHtml((row.normalized && row.normalized.house) || "无")}</b></div>
+        ${banner}
+        <div class="ab-outcomes">${outcomes}</div>
+    </div>`;
+}
+
+function renderAbExperiment(data, { embedded } = {}) {
+    const s = data.summary;
+    const snap = data.snapshot_current === false
+        ? '<span class="ab-snap stale">⚠ 当前地址表已与实验时快照不同（count/max_id/digest 变化），回看结果为历史存档</span>'
+        : '<span class="ab-snap ok">地址表快照一致</span>';
+    const statusTable = s.status_counts;
+    const profileCols = data.profiles
+        .map((p) => `<th>${escapeHtml(p.name)}</th>`).join("");
+    const statRows = (["auto_matched", "needs_review", "no_match"]).map((st) => `
+        <tr><td>${STATUS_LABEL[st] || st}</td>
+            ${data.profiles.map((p) => `<td>${statusTable[p.name][st]}</td>`).join("")}
+        </tr>`).join("");
+    const trigRows = (["auto_threshold", "margin_threshold", "reject_threshold"]).map((t) => `
+        <tr><td>${TRIGGER_LABEL[t]}</td>
+            ${data.profiles.map((p) => `<td>${s.triggered_counts[p.name][t]}</td>`).join("")}
+        </tr>`).join("");
+    const meta = embedded
+        ? ""
+        : `<div class="muted">实验编号 #${data.id} · ${escapeHtml(data.created_at || "")}</div>`;
+    return `
+    <div class="card ab-card">
+        <h2>${escapeHtml(data.name || `实验 #${data.id}`)}</h2>
+        ${meta}
+        <div class="ab-summary-bar">
+            ${snap}
+            <span class="ab-stat">共 <b>${s.queries}</b> 条查询 × <b>${s.profiles}</b> 个档案</span>
+            <span class="ab-stat ${s.disagreements ? "bad" : "good"}">
+                结论不一致 <b>${s.disagreements}</b> 条 · 一致 <b>${s.consensus_conclusions}</b> 条
+            </span>
+        </div>
+        <div class="table-wrap">
+            <table class="ab-table">
+                <thead><tr><th>状态 / 触发阈值</th>${profileCols}</tr></thead>
+                <tbody>${statRows}${trigRows}</tbody>
+            </table>
+        </div>
+    </div>
+    ${data.results.map(renderAbQueryResult).join("")}`;
+}
+
+async function runAbExperiment() {
+    const raw = $("#ab-queries").value.trim();
+    const queries = raw ? raw.split("\n").map((q) => q.trim()).filter(Boolean) : [];
+    const body = {
+        name: $("#ab-name").value.trim() || null,
+        profiles: collectAbProfiles(),
+        queries,
+    };
+    const btn = $("#btn-ab-run");
+    btn.disabled = true;
+    $("#ab-errors").innerHTML = "";
+    $("#ab-result").innerHTML = '<p class="muted">逐档运行中…</p>';
+    try {
+        const res = await fetch("/api/experiments", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            const errs = data.detail && data.detail.errors;
+            if (errs) renderAbErrors(errs);
+            else $("#ab-errors").innerHTML =
+                `<div class="ab-error-box">${escapeHtml((data.detail && data.detail.message) || data.detail || `请求失败 (${res.status})`)}</div>`;
+            $("#ab-result").innerHTML = "";
+            return;
+        }
+        $("#ab-result").innerHTML = renderAbExperiment(data, { embedded: true });
+    } catch (err) {
+        $("#ab-result").innerHTML = `<p class="err-msg">${escapeHtml(err.message)}</p>`;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function loadAbHistory() {
+    const box = $("#ab-history-box");
+    box.innerHTML = '<p class="muted">加载历史实验…</p>';
+    try {
+        const data = await api("/api/experiments?limit=50");
+        if (data.items.length === 0) {
+            box.innerHTML = '<div class="card"><p class="muted">暂无历史实验。</p></div>';
+            return;
+        }
+        box.innerHTML = `<div class="card">
+            <h2>历史实验（${data.total}）</h2>
+            <div class="table-wrap">
+                <table class="ab-table">
+                    <thead><tr><th>#</th><th>名称</th><th>档案数</th><th>查询数</th><th>不一致</th><th>快照</th><th>时间</th><th></th></tr></thead>
+                    <tbody>${data.items.map((it) => `
+                        <tr>
+                            <td>${it.id}</td>
+                            <td>${escapeHtml(it.name || "—")}</td>
+                            <td>${it.profile_count}</td>
+                            <td>${it.query_count}</td>
+                            <td class="${it.summary.disagreements ? "ab-bad" : ""}">${it.summary.disagreements}</td>
+                            <td>${it.snapshot_current ? "一致" : '<span class="ab-bad">已变化</span>'}</td>
+                            <td>${escapeHtml(it.created_at || "")}</td>
+                            <td><button class="tiny ghost ab-view" data-ab-id="${it.id}">回看</button></td>
+                        </tr>`).join("")}
+                    </tbody>
+                </table>
+            </div>
+        </div>`;
+    } catch (err) {
+        box.innerHTML = `<p class="err-msg">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+$("#btn-ab-run").addEventListener("click", runAbExperiment);
+$("#btn-ab-history").addEventListener("click", loadAbHistory);
+$("#btn-ab-demo").addEventListener("click", () => {
+    $("#ab-queries").value = AB_DEMO_QUERIES;
+});
+$("#btn-ab-add").addEventListener("click", () => {
+    if (abProfiles.length >= 4) return;
+    collectAbProfiles();
+    const i = abProfiles.length;
+    abProfiles.push({ name: `规则 ${abLetter(i)}`, auto_threshold: "",
+        reject_threshold: "", margin_threshold: "", token_weight: "" });
+    renderAbProfiles();
+});
+$("#ab-profiles").addEventListener("click", (event) => {
+    const btn = event.target.closest(".ab-remove");
+    if (!btn) return;
+    const idx = Number(btn.dataset.abRemove);
+    collectAbProfiles();
+    abProfiles.splice(idx, 1);
+    renderAbProfiles();
+});
+$("#ab-profiles").addEventListener("input", (event) => {
+    const inp = event.target.closest("[data-ab-field]");
+    if (!inp) return;
+    const card = inp.closest(".ab-profile");
+    const idx = Number(inp.dataset.abProfile);
+    abProfiles[idx][inp.dataset.abField] = inp.value.trim();
+    const eff = card.querySelector(".ab-effective");
+    if (eff) {
+        const p = abProfiles[idx];
+        eff.textContent =
+            `生效参数：自动命中 ${Number(p.auto_threshold || abDefaults.auto_threshold)}，` +
+            `拒绝 ${Number(p.reject_threshold || abDefaults.reject_threshold)}，` +
+            `分差 ${Number(p.margin_threshold || abDefaults.margin_threshold)}，` +
+            `词元权重 ${Number(p.token_weight || abDefaults.token_weight)}`;
+    }
+});
+$("#ab-history-box").addEventListener("click", async (event) => {
+    const btn = event.target.closest(".ab-view");
+    if (!btn) return;
+    const target = $("#ab-result");
+    target.innerHTML = '<p class="muted">加载实验结果…</p>';
+    try {
+        const data = await api(`/api/experiments/${Number(btn.dataset.abId)}`);
+        target.innerHTML = renderAbExperiment(data, {});
+        window.scrollTo({ top: target.offsetTop - 20, behavior: "smooth" });
+    } catch (err) {
+        target.innerHTML = `<p class="err-msg">${escapeHtml(err.message)}</p>`;
+    }
+});
+
+abProfiles = abDefaultProfiles();
+renderAbProfiles();
 
 refreshHealth();

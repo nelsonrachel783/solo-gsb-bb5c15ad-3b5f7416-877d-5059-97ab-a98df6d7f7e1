@@ -68,6 +68,20 @@ CREATE TABLE IF NOT EXISTS upload_previews (
     created_at      TEXT NOT NULL,
     expires_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS rule_experiments (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                TEXT,
+    table_snapshot      TEXT NOT NULL,      -- JSON digest captured before the run
+    query_count         INTEGER NOT NULL,
+    profile_count       INTEGER NOT NULL,
+    profiles_json       TEXT NOT NULL,      -- archived profile parameters (2-4)
+    queries_json        TEXT NOT NULL,      -- queries in submitted order
+    results_json        TEXT NOT NULL,      -- per-query, per-profile verdicts + diffs
+    summary_json        TEXT NOT NULL,      -- disagreement/consensus counts
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rule_experiments_created ON rule_experiments(created_at);
 """
 
 
@@ -325,3 +339,53 @@ def count_match_logs(conn: sqlite3.Connection, status: str | None = None) -> int
             .fetchone()[0]
         )
     return int(conn.execute("SELECT COUNT(*) FROM match_logs").fetchone()[0])
+
+
+# -------------------------------------------------------------- rule experiments
+
+
+def insert_rule_experiment(conn: sqlite3.Connection, *, name: str | None,
+                           table_snapshot: str, queries: list[str],
+                           profiles: list[dict[str, Any]],
+                           results: list[dict[str, Any]],
+                           summary: dict[str, Any]) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO rule_experiments
+            (name, table_snapshot, query_count, profile_count, profiles_json,
+             queries_json, results_json, summary_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            name,
+            table_snapshot,
+            len(queries),
+            len(profiles),
+            json.dumps(profiles, ensure_ascii=False),
+            json.dumps(queries, ensure_ascii=False),
+            json.dumps(results, ensure_ascii=False),
+            json.dumps(summary, ensure_ascii=False),
+            _now(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def get_rule_experiment(conn: sqlite3.Connection,
+                        experiment_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM rule_experiments WHERE id = ?", (experiment_id,)
+    ).fetchone()
+
+
+def list_rule_experiments(conn: sqlite3.Connection,
+                          limit: int = 100, offset: int = 0
+                          ) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM rule_experiments ORDER BY id DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+
+
+def count_rule_experiments(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM rule_experiments").fetchone()[0])
