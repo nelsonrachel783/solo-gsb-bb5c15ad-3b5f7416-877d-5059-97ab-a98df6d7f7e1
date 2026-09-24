@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, confloat, constr
 
 
 class MatchRequest(BaseModel):
@@ -56,3 +56,33 @@ class GroupReviewAction(BaseModel):
     match_ids: list[int] = Field(..., min_length=1)
     action: str = Field(..., pattern="^(confirmed|overridden|rejected)$")
     selected_id: int | None = None
+
+
+# ------------------------------------------------------------- A/B experiments
+
+
+class RuleProfile(BaseModel):
+    """一档命名规则档案：判定阈值 + 词元/门牌号权重。"""
+    name: constr(strip_whitespace=True, min_length=1, max_length=40) = Field(
+        ..., description="档案名称（同一实验内不可重复）"
+    )
+    auto_threshold: confloat(ge=0.0, le=1.0) = Field(
+        ..., description="自动命中阈值，达到该分且领先明显才自动命中"
+    )
+    reject_threshold: confloat(ge=0.0, le=1.0) = Field(
+        ..., description="拒绝阈值，首选低于该分即无匹配"
+    )
+    margin_threshold: confloat(ge=0.0, le=1.0) = Field(
+        ..., description="前两名分差小于该值时判为待确认（歧义）"
+    )
+    token_weight: confloat(ge=0.0, le=1.0) = Field(
+        ..., description="词元相似度权重，门牌号权重为 1 - token_weight"
+    )
+
+
+class ExperimentRequest(BaseModel):
+    """规则 A/B 对照实验请求：2~4 个档案 + 1~100 条查询。"""
+    profiles: list[RuleProfile] = Field(..., min_length=2, max_length=4)
+    queries: list[constr(strip_whitespace=True, min_length=1)] = Field(
+        ..., min_length=1, max_length=100
+    )

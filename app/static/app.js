@@ -193,6 +193,10 @@ $$(".tab").forEach((btn) => {
         $(`#tab-${btn.dataset.tab}`).classList.add("active");
         if (btn.dataset.tab === "table") loadAddresses();
         if (btn.dataset.tab === "review") loadReview();
+        if (btn.dataset.tab === "experiment") {
+            renderProfileEditor();
+            loadExperimentHistory();
+        }
     });
 });
 
@@ -619,6 +623,7 @@ async function refreshHealth() {
         $("#health").className = "badge ok";
         $("#addr-count").textContent = h.address_count;
         $("#review-count").textContent = h.needs_review;
+        if (h.default_thresholds) window.__defaultThresholds = h.default_thresholds;
     } catch (err) {
         $("#health").textContent = "服务不可用";
         $("#health").className = "badge bad";
@@ -626,3 +631,328 @@ async function refreshHealth() {
 }
 
 refreshHealth();
+
+// ========================================================== A/B experiments
+
+const AB_FIELDS = [
+    { key: "auto_threshold", label: "自动命中阈值", step: "0.01" },
+    { key: "reject_threshold", label: "拒绝阈值", step: "0.01" },
+    { key: "margin_threshold", label: "分差阈值", step: "0.01" },
+    { key: "token_weight", label: "词元权重", step: "0.05" },
+];
+
+const AB_DEMO = {
+    profiles: [
+        { name: "基线A", auto_threshold: 0.8, reject_threshold: 0.35, margin_threshold: 0.06, token_weight: 0.7 },
+        { name: "激进B", auto_threshold: 0.7, reject_threshold: 0.2, margin_threshold: 0.02, token_weight: 0.8 },
+    ],
+    queries: [
+        "123 Main Street, New York, NY 10001",
+        "1010 Lake Dr, Austin TX",
+        "Hillcrest Road, Dallas",
+        "北京東路８８號 3楼, 上海",
+        "1 Milky Way, Mars Base",
+    ].join("\n"),
+};
+
+// The editor keeps at most 4 profile cards; initialised lazily on first open.
+let abProfiles = null;
+
+function defaultThresholds() {
+    return window.__defaultThresholds ||
+        { auto_threshold: 0.8, reject_threshold: 0.35, margin_threshold: 0.06, token_weight: 0.7 };
+}
+
+function renderProfileEditor() {
+    if (abProfiles === null) {
+        const t = defaultThresholds();
+        abProfiles = [
+            { name: "基线A", ...t },
+            { name: "宽松B", auto_threshold: 0.7, reject_threshold: 0.25,
+              margin_threshold: 0.03, token_weight: t.token_weight },
+        ];
+    }
+    const box = $("#ab-profiles");
+    box.innerHTML = abProfiles.map((p, i) => `
+        <div class="ab-profile" data-index="${i}">
+            <div class="ab-profile-head">
+                <span class="ab-letter">${"ABCD"[i]}</span>
+                <input class="ab-name" type="text" maxlength="40"
+                       value="${escapeHtml(p.name)}" placeholder="档案名称">
+                ${abProfiles.length > 2 ?
+                    `<button class="tiny reject ab-remove" type="button">移除</button>` : ""}
+            </div>
+            <div class="ab-fields">
+                ${AB_FIELDS.map((f) => `
+                <label class="ab-field">
+                    <span>${f.label}</span>
+                    <input type="number" min="0" max="1" step="${f.step}"
+                           data-field="${f.key}" value="${p[f.key]}">
+                </label>`).join("")}
+            </div>
+        </div>`).join("");
+    $("#btn-ab-add").disabled = abProfiles.length >= 4;
+}
+
+function readProfileEditor() {
+    return $$("#ab-profiles .ab-profile").map((card) => {
+        const profile = { name: card.querySelector(".ab-name").value };
+        AB_FIELDS.forEach((f) => {
+            profile[f.key] = Number(card.querySelector(`input[data-field="${f.key}"]`).value);
+        });
+        return profile;
+    });
+}
+
+$("#ab-profiles").addEventListener("click", (event) => {
+    const btn = event.target.closest(".ab-remove");
+    if (!btn) return;
+    const idx = Number(btn.closest(".ab-profile").dataset.index);
+    abProfiles = readProfileEditor();
+    abProfiles.splice(idx, 1);
+    renderProfileEditor();
+});
+
+$("#btn-ab-add").addEventListener("click", () => {
+    abProfiles = readProfileEditor();
+    if (abProfiles.length >= 4) return;
+    abProfiles.push({
+        name: `规则${"ABCD"[abProfiles.length]}`,
+        ...defaultThresholds(),
+    });
+    renderProfileEditor();
+});
+
+$("#btn-ab-demo").addEventListener("click", () => {
+    abProfiles = AB_DEMO.profiles.map((p) => ({ ...p }));
+    $("#ab-queries").value = AB_DEMO.queries;
+    renderProfileEditor();
+});
+
+function renderExperimentErrors(errors) {
+    if (!errors || errors.length === 0) {
+        $("#ab-errors").innerHTML = "";
+        return;
+    }
+    const items = errors.map((e) => {
+        const where = e.type === "profile"
+            ? `第 ${e.index + 1} 档档案${e.field ? ` · ${fieldLabel(e.field)}` : ""}`
+            : e.type === "query"
+                ? `第 ${e.index + 1} 条查询`
+                : (e.type === "profiles" ? "档案列表" : "查询列表");
+        return `<li><b>${escapeHtml(where)}</b>：${escapeHtml(e.message)}</li>`;
+    }).join("");
+    $("#ab-errors").innerHTML =
+        `<div class="ab-errors"><div class="ab-errors-head">⛔ 校验失败，实验未执行（共 ${errors.length} 项）：</div><ul>${items}</ul></div>`;
+}
+
+function fieldLabel(key) {
+    const f = AB_FIELDS.find((x) => x.key === key);
+    return f ? f.label : key;
+}
+
+// ------------------------------------------------------------ result render
+
+function triggerBlock(th) {
+    const rows = [
+        ["auto_threshold", "自动命中阈值"],
+        ["reject_threshold", "拒绝阈值"],
+        ["margin_threshold", "前两名分差"],
+    ].map(([key, label]) => {
+        const block = th[key];
+        const actual = block.actual === null || block.actual === undefined ? "—" : pct(block.actual);
+        return `<div class="ab-thr${block.triggered ? " fired" : ""}">
+            <span>${label}</span>
+            <span class="muted">${pct(block.value)} / 实际 ${actual}</span>
+            <span>${block.triggered ? "⚠ 触发" : "未触发"}</span>
+        </div>`;
+    }).join("");
+    const decisive = th.decisive
+        ? `<div class="ab-decisive">决定性阈值：<b>${escapeHtml(fieldLabel(th.decisive))}</b></div>`
+        : `<div class="ab-decisive ok">得分达到自动命中阈值且领先明显，无阈值拦截</div>`;
+    return `<div class="ab-thr-grid">${rows}</div>${decisive}
+        <div class="muted">词元权重 ${pct(th.token_weight.value)} / 门牌号权重 ${pct(1 - th.token_weight.value)}</div>`;
+}
+
+function renderProfileColumn(pr) {
+    const delta = pr.score_delta_vs_first;
+    const deltaTxt = (delta !== null && pr.index > 0)
+        ? ` <span class="${delta === 0 ? "muted" : delta > 0 ? "ab-delta-up" : "ab-delta-down"}">` +
+          `(${delta > 0 ? "+" : ""}${pct(delta)})</span>`
+        : "";
+    const runner = pr.runner_up_id
+        ? `<div class="muted">次高分 #${pr.runner_up_id}：${pct(pr.runner_up_score)}</div>` : "";
+    return `
+    <div class="ab-col">
+        <div class="ab-col-head"><span class="ab-letter sm">${"ABCD"[pr.index]}</span> ${escapeHtml(pr.profile)}</div>
+        <span class="status ${pr.status}">${STATUS_LABEL[pr.status] || pr.status}</span>
+        <div class="ab-best">首选 #${pr.best_id ?? "—"} · <b>${pr.best_score === null ? "—" : pct(pr.best_score)}</b>${deltaTxt}</div>
+        ${runner}
+        <div class="muted">${escapeHtml(pr.reason)}</div>
+        ${triggerBlock(pr.thresholds)}
+    </div>`;
+}
+
+function renderDiffTable(qr) {
+    const diff = qr.candidate_diff;
+    if (!diff || diff.ranking.length === 0) return '<div class="muted">无候选</div>';
+    const heads = qr.profiles.map((pr) =>
+        `<th>${"ABCD"[pr.index]} ${escapeHtml(pr.profile)}</th>`).join("");
+    const bestIds = new Set(qr.profiles.map((pr) => pr.best_id));
+    const rows = diff.ranking.map((row) => {
+        const cells = row.cells.map((cell) => {
+            if (!cell.match) return '<td class="ab-cell absent">—</td>';
+            const isBest = bestIds.has(row.address_id) && cell.match.rank === 1;
+            return `<td class="ab-cell${isBest ? " best" : ""}">` +
+                `#${cell.match.rank} · ${pct(cell.match.score)}</td>`;
+        }).join("");
+        return `<tr>
+            <td class="ab-addr-cell">#${row.address_id} ${escapeHtml(row.full_text)}
+                ${row.house ? `<span class="muted">（门牌 ${escapeHtml(row.house)}）</span>` : ""}</td>
+            ${cells}
+        </tr>`;
+    }).join("");
+    return `<div class="table-wrap ab-diff-wrap"><table class="ab-diff">
+        <thead><tr><th>候选地址（各档排名 · 得分）</th>${heads}</tr></thead>
+        <tbody>${rows}</tbody></table></div>`;
+}
+
+function renderExperimentResult(exp) {
+    const s = exp.summary;
+    const profHeads = s.profiles.map((p) => {
+        return `<div class="ab-sum-cell">
+            <b>${escapeHtml(p.name)}</b><br>
+            <span class="status auto_matched">${p.auto_matched}</span>
+            <span class="status needs_review">${p.needs_review}</span>
+            <span class="status no_match">${p.no_match}</span>
+        </div>`;
+    }).join("");
+    const snapshot = typeof exp.table_snapshot === "string"
+        ? JSON.parse(exp.table_snapshot) : exp.table_snapshot;
+
+    const queries = exp.results.map((qr) => {
+        const da = qr.disagreement;
+        const range = da.best_score_range.delta === null ? "" :
+            ` · 首选分差区间 ${pct(da.best_score_range.min)}~${pct(da.best_score_range.max)}` +
+            `（极差 ${pct(da.best_score_range.delta)}）`;
+        const groups = Object.entries(da.status_groups).map(([st, names]) =>
+            `<span class="status ${st}">${STATUS_LABEL[st] || st}：${escapeHtml(names.join("、"))}</span>`
+        ).join(" ");
+        return `
+        <div class="ab-query${da.conclusion_differs ? " disagree" : ""}">
+            <div class="query-line">
+                ${da.conclusion_differs ? '<span class="ab-flag">⚠ 结论不一致</span>' : '<span class="ab-flag agree">✓ 各档一致</span>'}
+                #${qr.index + 1} ${escapeHtml(qr.query)}
+            </div>
+            <div class="muted">归一化：${escapeHtml(qr.profiles[0].normalized.text || "（空）")}
+                · 门牌号 ${escapeHtml(qr.profiles[0].normalized.house || "无")}${range}</div>
+            <div class="ab-groups">${groups}</div>
+            <div class="ab-cols">${qr.profiles.map(renderProfileColumn).join("")}</div>
+            <details class="ab-details" ${da.conclusion_differs ? "open" : ""}>
+                <summary>候选差异（${qr.candidate_diff.ranking.length} 个候选进入并集）</summary>
+                ${renderDiffTable(qr)}
+                <div class="ab-fulldiff">
+                    ${qr.profiles.map((pr) => `
+                    <details class="ab-cand-detail">
+                        <summary>${"ABCD"[pr.index]} ${escapeHtml(pr.profile)} 的完整候选（${pr.candidates.length}）</summary>
+                        ${pr.candidates.map((c, i) => renderCandidate(c, i, {})).join("")}
+                    </details>`).join("")}
+                </div>
+            </details>
+        </div>`;
+    }).join("");
+
+    $("#ab-result").innerHTML = `
+    <div class="card ab-result-card">
+        <div class="ab-result-head">
+            <h2>实验结果 <span class="ab-eid">${escapeHtml(exp.id)}</span></h2>
+            <span class="muted">${escapeHtml(exp.created_at)} · 地址表快照 ${snapshot.count} 条
+                · digest ${escapeHtml(String(snapshot.digest).slice(0, 12))}…</span>
+        </div>
+        <div class="ab-summary">
+            <div class="ab-sum-cell"><b>查询</b><br><span class="muted">共 ${s.query_count} 条</span><br>
+                <span class="${s.disagreement_count ? "ab-flag" : "ab-flag agree"}">不一致 ${s.disagreement_count}</span></div>
+            ${profHeads}
+        </div>
+        <p class="hint">状态计数依次为：自动命中 / 待确认 / 无匹配。</p>
+        ${queries}
+    </div>`;
+}
+
+async function submitExperiment() {
+    const profiles = readProfileEditor();
+    const queries = $("#ab-queries").value.split("\n").map((q) => q.trim()).filter(Boolean);
+    $("#ab-errors").innerHTML = "";
+    $("#ab-result").innerHTML = "";
+    const btn = $("#btn-ab-run");
+    btn.disabled = true;
+    $("#ab-run-summary").innerHTML = '<span class="muted">实验运行中…</span>';
+    try {
+        const res = await fetch("/api/experiments", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ profiles, queries }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            renderExperimentErrors(data.errors || [{ type: "request", index: null, field: null, message: data.detail || "请求失败" }]);
+            $("#ab-run-summary").innerHTML = "";
+            return;
+        }
+        $("#ab-run-summary").innerHTML =
+            `<span class="ok-msg">实验 ${escapeHtml(data.id)} 完成：${data.summary.query_count} 条查询，` +
+            `结论不一致 ${data.summary.disagreement_count} 条，已持久化</span>`;
+        renderExperimentResult(data);
+        loadExperimentHistory();
+    } catch (err) {
+        renderExperimentErrors([{ type: "request", index: null, field: null, message: err.message }]);
+        $("#ab-run-summary").innerHTML = "";
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+$("#btn-ab-run").addEventListener("click", submitExperiment);
+
+// -------------------------------------------------------------- history
+
+async function loadExperimentHistory() {
+    const box = $("#ab-history");
+    if (!box) return;
+    try {
+        const data = await api("/api/experiments?limit=50");
+        if (data.items.length === 0) {
+            box.innerHTML = '<p class="muted">暂无实验记录。</p>';
+            return;
+        }
+        box.innerHTML = `<div class="table-wrap"><table>
+            <thead><tr><th>实验编号</th><th>提交时间</th><th>档案</th><th>查询</th><th>不一致</th></tr></thead>
+            <tbody>${data.items.map((it) => `<tr>
+                <td><a href="#" class="ab-open" data-id="${escapeHtml(it.id)}">${escapeHtml(it.id)}</a></td>
+                <td>${escapeHtml(it.created_at)}</td>
+                <td>${it.profiles.map((p) => escapeHtml(p.name)).join(" / ")}</td>
+                <td>${it.query_count}</td>
+                <td>${it.summary.disagreement_count ?
+                    `<span class="ab-flag">${it.summary.disagreement_count}</span>` :
+                    '<span class="ab-flag agree">0</span>'}</td>
+            </tr>`).join("")}</tbody></table></div>
+            ${data.total > 50 ? `<p class="muted">共 ${data.total} 个实验，仅显示最近 50 个</p>` : ""}`;
+    } catch (err) {
+        box.innerHTML = `<p class="err-msg">${escapeHtml(err.message)}</p>`;
+    }
+}
+
+$("#btn-ab-refresh-history").addEventListener("click", loadExperimentHistory);
+
+$("#ab-history").addEventListener("click", async (event) => {
+    const link = event.target.closest(".ab-open");
+    if (!link) return;
+    event.preventDefault();
+    try {
+        const data = await api(`/api/experiments/${encodeURIComponent(link.dataset.id)}`);
+        renderExperimentResult(data);
+        window.scrollTo({ top: $("#ab-result").offsetTop - 60, behavior: "smooth" });
+    } catch (err) {
+        alert(err.message);
+    }
+});

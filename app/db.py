@@ -68,6 +68,17 @@ CREATE TABLE IF NOT EXISTS upload_previews (
     created_at      TEXT NOT NULL,
     expires_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ab_experiments (
+    id              TEXT PRIMARY KEY,       -- EXP-<UTC timestamp>-<random>
+    profiles_json   TEXT NOT NULL,          -- rule profiles (A/B/...) in order
+    queries_json    TEXT NOT NULL,          -- queries in submitted order
+    table_snapshot  TEXT NOT NULL,          -- JSON digest of the frozen address table
+    address_count   INTEGER NOT NULL,
+    results_json    TEXT NOT NULL,          -- per-query, per-profile results + diffs
+    summary_json    TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 """
 
 
@@ -325,3 +336,51 @@ def count_match_logs(conn: sqlite3.Connection, status: str | None = None) -> int
             .fetchone()[0]
         )
     return int(conn.execute("SELECT COUNT(*) FROM match_logs").fetchone()[0])
+
+
+# ----------------------------------------------------------- A/B experiments --
+
+
+def insert_ab_experiment(conn: sqlite3.Connection, *, experiment_id: str,
+                         profiles: list[dict[str, Any]], queries: list[str],
+                         table_snapshot: str, address_count: int,
+                         results: list[dict[str, Any]],
+                         summary: dict[str, Any], created_at: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO ab_experiments
+            (id, profiles_json, queries_json, table_snapshot, address_count,
+             results_json, summary_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            experiment_id,
+            json.dumps(profiles, ensure_ascii=False),
+            json.dumps(queries, ensure_ascii=False),
+            table_snapshot,
+            address_count,
+            json.dumps(results, ensure_ascii=False),
+            json.dumps(summary, ensure_ascii=False),
+            created_at,
+        ),
+    )
+
+
+def get_ab_experiment(conn: sqlite3.Connection, experiment_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM ab_experiments WHERE id = ?", (experiment_id,)
+    ).fetchone()
+
+
+def list_ab_experiments(conn: sqlite3.Connection, limit: int = 50,
+                        offset: int = 0) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, profiles_json, queries_json, table_snapshot, address_count,"
+        " summary_json, created_at FROM ab_experiments"
+        " ORDER BY id DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+
+
+def count_ab_experiments(conn: sqlite3.Connection) -> int:
+    return int(conn.execute("SELECT COUNT(*) FROM ab_experiments").fetchone()[0])

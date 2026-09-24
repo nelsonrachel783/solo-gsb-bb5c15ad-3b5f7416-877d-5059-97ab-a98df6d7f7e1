@@ -6,8 +6,9 @@
 过小的候选会被标记为 **待确认（needs_review）**，并在界面上展示命中词元、冲突字段与
 可复核结果。
 
-- 🌐 网页界面：单条/批量匹配、上传标准地址 CSV、待确认队列人工复核（含同案合并复核、复核共识记忆）
-- 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、复核接口（含 `/docs` Swagger）
+- 🌐 网页界面：单条/批量匹配、**规则 A/B 对照实验**、上传标准地址 CSV、待确认队列人工复核（含同案合并复核、复核共识记忆）
+- 🧪 **规则 A/B 对照实验**：提交 2～4 个命名规则档案（自动命中/拒绝/分差阈值 + 词元权重）与 1～100 条查询，在同一地址表快照下逐档运行，逐条对比状态/首选/得分/候选差异并标出不一致与触发阈值，结果按实验编号持久化回看
+- 🔌 REST API：`/api/match`、`/api/match/batch`、`/api/addresses`、复核接口、A/B 实验接口（含 `/docs` Swagger）
 - 🗄️ SQLite 持久化，零外部依赖，数据通过 Docker volume 保存
 - 🌍 归一化：NFKC + 变音符折叠 + 繁简中文映射 + 全角字符、道路缩写（St/Rd/Ave…）、门牌号（`#12-B`/`No.12b`/`12号`）
 - 👥 同案合并复核：归一化后道路/地区词元与门牌号一致、且候选（ID/顺序/得分）完全相同的待确认记录自动归组，可整组确认首选、改派共同候选或判无匹配；整组写入在单个 SQLite 写事务内完成，组成员或签名有变化即整体冲突回滚
@@ -31,7 +32,10 @@ docker compose up --build
 
 - **端口**：`8000`（在 `docker-compose.yml` 的 `ports` 中修改）
 - 首次启动会自动加载内置示例标准地址（`sample_data/standard_addresses.csv`，共 15 条，含中英文地址）
-- SQLite 数据库保存在 Docker volume `address-data`（容器内 `/data/addresses.db`），重启不丢失
+- SQLite 数据库保存在 Docker volume `address-data`（容器内 `/data/addresses.db`），重启不丢失（A/B 实验记录同样持久化在该库）
+- **必要配置**：开箱无需任何配置；`docker-compose.yml` 中的 `AUTO_THRESHOLD` / `MARGIN_THRESHOLD` /
+  `REJECT_THRESHOLD` / `TOKEN_WEIGHT` 环境变量仅作为常规匹配的默认值与网页实验表单的预填值，
+  A/B 实验中每档参数都可在请求里单独覆盖，无需重建镜像
 
 不用 Docker 时：
 
@@ -121,6 +125,83 @@ curl -s -X POST http://localhost:8000/api/addresses/confirm \
   需要重新调用预览接口；
 - 确认成功后凭证立即失效（一次性），且仅写入该次预览中分类为「有效」的记录；
 - 「标准地址表」页默认勾选「上传前先预览确认」；取消勾选则继续使用直接上传接口。
+
+---
+
+## 规则 A/B 对照实验
+
+在同一标准地址表快照下，用 **2～4 个命名规则档案** 对 **1～100 条查询** 逐档运行现有匹配器，
+用来比较不同阈值 / 权重组合的判定差异。实验是**纯评分对照**：不查询复核共识记忆、
+不写入匹配日志与待确认队列；匹配器本身完全不变。
+
+网页打开 http://localhost:8000 后切换到 **「规则 A/B 实验」** 标签：默认预置「基线A / 宽松B」两档，
+可增删到 4 档、逐档调整 4 个参数，粘贴查询后点击「开始对照实验」；下方「历史实验」可按编号回看。
+
+每个档案包含 4 个参数（均为 0～1 的数值）：
+
+| 参数 | 含义 |
+| --- | --- |
+| `auto_threshold` | 自动命中阈值，首选得分达到该值且领先次选足够明显才自动命中 |
+| `reject_threshold` | 拒绝阈值，首选得分低于该值判 `no_match`（必须严格小于自动命中阈值） |
+| `margin_threshold` | 前两名分差小于该值判 `needs_review`（歧义） |
+| `token_weight` | 词元相似度权重，门牌号权重为 `1 - token_weight` |
+
+返回内容（逐条查询 × 逐档）：
+
+- **各档结论**：状态（`auto_matched` / `needs_review` / `no_match`）、首选地址 ID 与得分
+  （以及相对第一档的分差）、次高分、判定原因；
+- **触发阈值**：自动命中 / 拒绝 / 分差三个条件分别给出阈值、实测值（首选分或前两名分差）与
+  是否触发，并标出**决定性阈值**（最终决定结论的那条规则）；
+- **结论不一致标记**：各档状态或首选地址任一不同即标「⚠ 结论不一致」，并按状态分组展示；
+- **候选差异**：所有档候选取并集，按地址给出各档的排名与得分（未进入该档 top-5 标 `—`），
+  并可展开查看每档完整候选（词元命中、冲突等明细）；
+- **汇总**：每档 自动命中 / 待确认 / 无匹配 计数、不一致查询总数，以及实验所用地址表快照
+  （行数、最大 ID、摘要 digest）。
+
+**逐项校验、不执行**：档案数量不是 2～4、查询数量不是 1～100、参数非数值 / 越界、
+拒绝阈值 ≥ 自动命中阈值、档案重名、查询为空或**完全重复**（去空白后逐条比较）等问题会
+一次性按 `档案/查询 + 序号 + 字段` 列在 `errors` 中返回 `400`，只要存在任何一项错误就
+**不运行、不持久化**。
+
+**持久化与稳定性**：实验结果（档案、查询、快照、全部逐档结果、汇总）写入 SQLite，
+可按实验编号（`EXP-<UTC时间>-<随机>`）随时回看。匹配是确定性的，同一输入顺序、
+同一地址表快照下重复提交得到完全一致的结果（编号与时间戳除外）；地址表变化后重跑会得到
+新的快照 digest，但旧实验仍按其保存的快照原文回放。
+
+```bash
+# 提交一次两档对照实验
+curl -s -X POST http://localhost:8000/api/experiments \
+  -H 'Content-Type: application/json' -d '{
+    "profiles": [
+      {"name": "基线A", "auto_threshold": 0.80, "reject_threshold": 0.35,
+       "margin_threshold": 0.06, "token_weight": 0.70},
+      {"name": "激进B", "auto_threshold": 0.70, "reject_threshold": 0.20,
+       "margin_threshold": 0.02, "token_weight": 0.80}
+    ],
+    "queries": ["1010 Lake Dr, Austin TX", "Hillcrest Road, Dallas",
+                "1 Milky Way, Mars Base"]
+  }'
+
+# 历史列表 / 按编号回看完整结果
+curl -s http://localhost:8000/api/experiments
+curl -s http://localhost:8000/api/experiments/EXP-20260924T075404-358e3e3e
+
+# 参数非法 + 查询重复 -> 400，errors 逐项列出，实验不执行
+curl -s -X POST http://localhost:8000/api/experiments \
+  -H 'Content-Type: application/json' -d '{
+    "profiles": [
+      {"name": "X", "auto_threshold": 1.5, "reject_threshold": 0.3,
+       "margin_threshold": 0.1, "token_weight": 0.7},
+      {"name": "X", "auto_threshold": 0.4, "reject_threshold": 0.5,
+       "margin_threshold": 0.1, "token_weight": 2}
+    ],
+    "queries": ["abc", "abc"]
+  }'
+# => {"detail":"请求参数校验失败","errors":[
+#      {"type":"profile","index":0,"field":"auto_threshold","message":"auto_threshold=1.5 超出允许范围 [0, 1]"},
+#      {"type":"profile","index":1,"field":"name","message":"档案名称与第 1 档重复：…"},
+#      {"type":"query","index":1,"field":null,"message":"查询与第 1 条完全重复：…"}, ...]}
+```
 
 CSV 支持的列名（均可识别别名，表头大小写不敏感）：
 
@@ -269,6 +350,9 @@ curl -s -X POST http://localhost:8000/api/review-groups/review \
 | POST | `/api/addresses/load-sample` | 重新加载内置示例数据 |
 | POST | `/api/match` | 单条地址匹配（评分后应用复核共识记忆，返回 `consensus` 判定） |
 | POST | `/api/match/batch` | 批量地址匹配（每条独立应用复核共识记忆） |
+| POST | `/api/experiments` | 提交规则 A/B 对照实验（2~4 档案 × 1~100 查询，同一快照逐档运行；非法参数/重复查询逐项报错且不执行） |
+| GET | `/api/experiments` | 历史实验列表（编号、档案、查询数、各档计数与不一致数） |
+| GET | `/api/experiments/{id}` | 按实验编号回看完整结果（档案、查询、快照、逐档结果与候选差异） |
 | GET | `/api/matches?status=needs_review` | 匹配记录/待确认队列 |
 | GET | `/api/matches/{id}` | 单条匹配详情 |
 | POST | `/api/matches/{id}/review` | 单条复核：confirmed / overridden / rejected |
@@ -315,6 +399,7 @@ curl -s -X POST http://localhost:8000/api/review-groups/review \
 │   ├── db.py              # SQLite 表结构与读写
 │   ├── normalization.py   # Unicode/缩写/门牌号归一化与分词
 │   ├── matcher.py         # 词元与门牌号相似度、候选判定
+│   ├── experiments.py     # 规则 A/B 对照实验：逐档运行、差异分析与持久化
 │   ├── consensus.py       # 复核共识记忆：历史复核聚合与自动指向
 │   ├── review_groups.py   # 同案合并复核：归组与整组事务写入
 │   ├── ingest.py          # CSV / JSON 标准地址导入

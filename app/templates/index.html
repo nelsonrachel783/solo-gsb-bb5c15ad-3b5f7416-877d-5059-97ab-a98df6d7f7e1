@@ -16,7 +16,8 @@
 </header>
 
 <nav class="tabs">
-    <button class="tab active" data-tab="match">单条 / 批量匹配</button>
+    <button class="tab" data-tab="match">单条 / 批量匹配</button>
+    <button class="tab" data-tab="experiment">规则 A/B 实验</button>
     <button class="tab" data-tab="table">标准地址表 <span id="addr-count" class="count"></span></button>
     <button class="tab" data-tab="review">待确认队列 <span id="review-count" class="count"></span></button>
 </nav>
@@ -36,6 +37,40 @@
             </div>
         </div>
         <div id="results"></div>
+    </section>
+
+    <!-- ====================== rule A/B experiments ===================== -->
+    <section id="tab-experiment" class="panel">
+        <div class="card">
+            <h2>规则 A/B 对照实验</h2>
+            <p class="hint">
+                提交 2~4 个命名规则档案（自动命中 / 拒绝 / 分差阈值与词元权重）和 1~100 条查询，
+                服务端在<b>同一标准地址表快照</b>下逐档运行现有匹配器。档案参数非法或查询重复时逐项报错且不执行；
+                结果持久化，可按实验编号回看。
+            </p>
+            <div id="ab-profiles" class="ab-profiles"></div>
+            <div class="row">
+                <button id="btn-ab-add" class="ghost">＋ 增加一档（最多 4 档）</button>
+            </div>
+            <h2 class="ab-subtitle">实验查询</h2>
+            <textarea id="ab-queries" rows="4"
+                placeholder="每行一条查询，1~100 条，不可完全重复"></textarea>
+            <div class="row">
+                <button id="btn-ab-run" class="primary">开始对照实验</button>
+                <button id="btn-ab-demo" class="ghost">填充示例</button>
+                <span id="ab-run-summary"></span>
+            </div>
+            <div id="ab-errors"></div>
+        </div>
+        <div id="ab-result"></div>
+        <div class="card" id="ab-history-card">
+            <h2>历史实验</h2>
+            <div class="row">
+                <button id="btn-ab-refresh-history" class="ghost">刷新历史</button>
+                <span class="hint">点击编号回看完整结果</span>
+            </div>
+            <div id="ab-history"></div>
+        </div>
     </section>
 
     <!-- ====================== standard address table =================== -->

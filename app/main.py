@@ -6,17 +6,18 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import consensus, db, ingest, review_groups
+from . import consensus, db, experiments, ingest, review_groups
 from .config import Settings, get_settings
 from .matcher import candidate_to_dict, match_address, result_to_dict
 from .schemas import (
     AddressBatchIn,
     BatchMatchRequest,
+    ExperimentRequest,
     GroupReviewAction,
     MatchRequest,
     ReviewAction,
@@ -53,6 +54,9 @@ async def lifespan(_app: FastAPI):
     yield
     if _conn is not None:
         _conn.close()
+        # Reset so a later startup (e.g. a second TestClient in tests)
+        # opens a fresh connection instead of reusing the closed one.
+        globals()["_conn"] = None
 
 
 app = FastAPI(
@@ -63,6 +67,30 @@ app = FastAPI(
 )
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+
+def _custom_openapi() -> dict[str, Any]:
+    """Include the manually-validated experiment body in the Swagger schema."""
+    from fastapi.openapi.utils import get_openapi
+
+    if app.openapi_schema is not None:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title, version=app.version, description=app.description,
+        routes=app.routes,
+    )
+    components = schema.setdefault("components", {}).setdefault("schemas", {})
+    full = ExperimentRequest.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    )
+    # Nested models (RuleProfile) land in $defs; hoist them next to the others.
+    components.update(full.pop("$defs", {}))
+    components["ExperimentRequest"] = full
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi
 
 
 # -------------------------------------------------------------------- pages --
@@ -77,11 +105,18 @@ def index(request: Request) -> HTMLResponse:
 
 
 @app.get("/api/health")
-def health(conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+def health(conn: db.sqlite3.Connection = Depends(get_conn),
+           settings: Settings = Depends(settings_dep)) -> dict[str, Any]:
     return {
         "status": "ok",
         "address_count": db.count_addresses(conn),
         "needs_review": db.count_match_logs(conn, "needs_review"),
+        "default_thresholds": {
+            "auto_threshold": settings.auto_threshold,
+            "margin_threshold": settings.margin_threshold,
+            "reject_threshold": settings.reject_threshold,
+            "token_weight": settings.token_weight,
+        },
     }
 
 
@@ -375,3 +410,59 @@ def review_group(payload: GroupReviewAction,
     except review_groups.GroupReviewError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, **result}
+
+
+# --- rule A/B comparison experiments ----------------------------------------
+
+
+@app.post(
+    "/api/experiments",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": "#/components/schemas/ExperimentRequest"}
+                }
+            },
+        },
+    },
+)
+def create_experiment(payload: dict[str, Any] = Body(...),
+                      conn: db.sqlite3.Connection = Depends(get_conn),
+                      settings: Settings = Depends(settings_dep)) -> dict[str, Any]:
+    """提交规则 A/B 对照实验：2~4 个命名档案 + 1~100 条查询。
+
+    档案参数非法或查询重复时逐项返回 ``errors`` 且不执行实验；
+    通过校验后，所有档案在同一标准地址表快照上逐档运行现有匹配器。
+    档案/查询数量、参数取值范围、档案重名、阈值次序与查询重复均逐项报错。
+    """
+    if db.count_addresses(conn) == 0:
+        raise HTTPException(status_code=400, detail="标准地址表为空，请先上传或加载示例数据")
+    try:
+        return experiments.run_experiment(conn, payload, settings)
+    except experiments.ExperimentValidationError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "请求参数校验失败", "errors": exc.errors},
+        )
+
+
+@app.get("/api/experiments")
+def list_experiments(limit: int = 50, offset: int = 0,
+                     conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    limit = max(1, min(limit, 200))
+    rows = db.list_ab_experiments(conn, limit=limit, offset=offset)
+    return {
+        "total": db.count_ab_experiments(conn),
+        "items": [experiments.serialize_experiment_summary(r) for r in rows],
+    }
+
+
+@app.get("/api/experiments/{experiment_id}")
+def get_experiment(experiment_id: str,
+                   conn: db.sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
+    row = db.get_ab_experiment(conn, experiment_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="实验不存在")
+    return experiments.serialize_experiment(row)
